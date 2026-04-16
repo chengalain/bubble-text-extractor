@@ -1,0 +1,28 @@
+# Environnement virtuel
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Output
+output/
+
+# Fichiers temporaires OCR
+/tmp/bubble_ocr_*/
+
+# EasyOCR models cache
+.EasyOCR/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
