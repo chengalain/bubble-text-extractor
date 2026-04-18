@@ -15,7 +15,7 @@ output/
 
 # Fichiers temporaires OCR
 /tmp/bubble_ocr_*/
-
+    
 # EasyOCR models cache
 .EasyOCR/
 

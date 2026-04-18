@@ -1,4 +1,4 @@
-# engine.py — Hybrid : masque bulles blanches + EasyOCR full-page
+# engine.py — EasyOCR + upscaling 2x + masque bulles blanches
 import cv2
 import numpy as np
 from pathlib import Path
@@ -11,22 +11,14 @@ except ImportError:
 
 
 class OCREngine:
-    """
-    Pipeline hybride :
-    1. Masque des régions blanches (bulles manga ≈ blanc pur)
-    2. EasyOCR sur la page entière (CRAFT détecte les zones de texte)
-    3. On ne garde que les détections dont le centre tombe dans une bulle blanche
-    4. Regroupement des lignes proches en une seule bulle
-    """
-
-    CONFIDENCE_THRESHOLD = 0.45
-    WHITE_THRESHOLD      = 210   # pixel >= cette valeur → considéré "blanc"
+    CONFIDENCE_THRESHOLD = 0.40
+    WHITE_THRESHOLD      = 220
+    UPSCALE_FACTOR       = 2.0   # upscale avant OCR → meilleure lecture
 
     def __init__(self, lang: str = "en"):
         self.lang    = lang
         self._reader = None
 
-    # ── Init lazy EasyOCR ──────────────────────────────────────────────────────
     def _get_reader(self):
         if self._reader is None:
             if not _EASYOCR_AVAILABLE:
@@ -34,59 +26,74 @@ class OCREngine:
             self._reader = easyocr.Reader([self.lang], gpu=False, verbose=False)
         return self._reader
 
-    # ── Chargement ────────────────────────────────────────────────────────────
-    @staticmethod
-    def _load(image_path: Path) -> np.ndarray:
+    # ── Chargement + upscaling ─────────────────────────────────────────────────
+    def _load_and_upscale(self, image_path: Path) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Retourne (img_original, img_upscaled).
+        Le masque est calculé sur l'original, l'OCR tourne sur l'upscaled.
+        """
         img = cv2.imread(str(image_path))
         if img is None:
             raise ValueError(f"Impossible de charger : {image_path}")
-        return img
 
-    # ── Masque des bulles blanches ─────────────────────────────────────────────
+        h, w = img.shape[:2]
+        upscaled = cv2.resize(
+            img,
+            (int(w * self.UPSCALE_FACTOR), int(h * self.UPSCALE_FACTOR)),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        # Légère netteté après upscale pour les contours de lettres
+        kernel   = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+        upscaled = cv2.filter2D(upscaled, -1, kernel)
+
+        return img, upscaled
+
+    # ── Masque bulles blanches ─────────────────────────────────────────────────
     def _bubble_mask(self, img: np.ndarray) -> np.ndarray:
         """
-        Retourne un masque binaire où les pixels blancs (bulles) valent 255.
-        Stratégie :
-          - Seuillage sur les pixels très clairs (>= WHITE_THRESHOLD)
-          - Fermeture morphologique pour boucher les trous dans les bulles
-          - Ouverture pour éliminer le bruit (petites zones blanches isolées)
+        Masque ne conservant que les régions blanches fermées de taille
+        cohérente avec une bulle (ni pixel isolé, ni ciel entier).
         """
+        h_img, w_img = img.shape[:2]
+        page_area    = h_img * w_img
+
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        _, mask = cv2.threshold(gray, self.WHITE_THRESHOLD, 255, cv2.THRESH_BINARY)
+        _, binary = cv2.threshold(gray, self.WHITE_THRESHOLD, 255, cv2.THRESH_BINARY)
 
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=4)
-        mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=2)
+        closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=4)
+        opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN,  kernel, iterations=2)
+
+        # Garder uniquement les contours de taille bulle (0.5 % – 40 % de la page)
+        contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        mask = np.zeros_like(opened)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if page_area * 0.005 < area < page_area * 0.40:
+                cv2.drawContours(mask, [cnt], -1, 255, thickness=cv2.FILLED)
 
         return mask
 
-    # ── Filtre spatial : ne garder que le texte dans les bulles ───────────────
+    # ── Filtre spatial ─────────────────────────────────────────────────────────
     @staticmethod
-    def _in_bubble(bbox: list, mask: np.ndarray) -> bool:
-        """
-        Retourne True si le centre de la bbox tombe dans une zone blanche du masque.
-        bbox = [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
-        """
-        cx = int(sum(p[0] for p in bbox) / 4)
-        cy = int(sum(p[1] for p in bbox) / 4)
+    def _in_bubble(bbox: list, mask: np.ndarray, scale: float) -> bool:
+        """Centre de la bbox ramenée à l'échelle du masque (original)."""
+        cx = int(sum(p[0] for p in bbox) / 4 / scale)
+        cy = int(sum(p[1] for p in bbox) / 4 / scale)
         h, w = mask.shape
         cx = max(0, min(cx, w - 1))
         cy = max(0, min(cy, h - 1))
         return mask[cy, cx] == 255
 
-    # ── Regroupement des lignes en bulles ──────────────────────────────────────
+    # ── Regroupement lignes → bulles ───────────────────────────────────────────
     @staticmethod
-    def _group_into_bubbles(results: list, line_gap: int = 30) -> list[str]:
-        """
-        Regroupe les détections proches verticalement (même bulle).
-        line_gap : écart max en pixels entre deux lignes d'une même bulle.
-        """
+    def _group_into_bubbles(results: list, line_gap: int = 40) -> list[str]:
         if not results:
             return []
 
-        bubbles: list[list[str]]  = []
-        current: list[str]        = [results[0][1]]
-        prev_bottom: float        = results[0][0][2][1]
+        bubbles: list[list[str]] = []
+        current: list[str]       = [results[0][1]]
+        prev_bottom: float       = results[0][0][2][1]
 
         for bbox, text, _ in results[1:]:
             y_top = bbox[0][1]
@@ -98,42 +105,32 @@ class OCREngine:
             prev_bottom = bbox[2][1]
 
         bubbles.append(current)
-        return [" ".join(group) for group in bubbles]
+        return [" ".join(g) for g in bubbles]
 
     # ── Point d'entrée public ──────────────────────────────────────────────────
     def extract_from_images(self, image_paths: list[Path]) -> list[str]:
-        """
-        Traite une liste d'images de manga.
-        Retourne une liste de strings, une par bulle détectée.
-        """
         reader     = self._get_reader()
         all_texts: list[str] = []
 
         for image_path in image_paths:
             try:
-                img = self._load(image_path)
+                img_orig, img_up = self._load_and_upscale(image_path)
             except ValueError:
                 continue
 
-            # 1. Masque des zones blanches (bulles)
-            mask = self._bubble_mask(img)
+            mask    = self._bubble_mask(img_orig)
+            results = reader.readtext(img_up, paragraph=False)
 
-            # 2. EasyOCR sur la page entière
-            results = reader.readtext(img, paragraph=False)
-
-            # 3. Filtrer : confiance + centre dans une bulle blanche
             filtered = [
                 r for r in results
                 if r[2] >= self.CONFIDENCE_THRESHOLD
                 and r[1].strip()
-                and self._in_bubble(r[0], mask)
+                and self._in_bubble(r[0], mask, self.UPSCALE_FACTOR)
             ]
 
-            # 4. Trier top→bottom, left→right
             filtered.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
-
-            # 5. Regrouper les lignes proches
-            bubbles = self._group_into_bubbles(filtered)
+            # line_gap en pixels upscalés — large pour ne pas couper une bulle en deux
+            bubbles = self._group_into_bubbles(filtered, line_gap=80)
             all_texts.extend(bubbles)
 
         return all_texts
